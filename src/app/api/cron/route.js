@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { Api } from "node-telegram-bot-api";
 import { getActiveTasks, updateTask, STATUS } from "@/lib/tasks";
 
+export const dynamic = "force-dynamic";
+
 const api = new Api(process.env.TELEGRAM_BOT_TOKEN);
 
 function nowInParts() {
