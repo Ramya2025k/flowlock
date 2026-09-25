@@ -12,7 +12,10 @@ function nowInParts() {
 }
 
 function taskEpoch(task) {
-  return new Date(`${task.date}T${task.time}:00`).getTime();
+  // Task times are stored as IST (UTC+5:30). Convert to a true UTC timestamp.
+  const IST_OFFSET_MINUTES = 5 * 60 + 30;
+  const localDateTime = new Date(`${task.date}T${task.time}:00Z`);
+  return localDateTime.getTime() - IST_OFFSET_MINUTES * 60 * 1000;
 }
 
 export async function GET() {
