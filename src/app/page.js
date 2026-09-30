@@ -14,8 +14,51 @@ const CATEGORY_COLORS = {
 function todayString() {
   return new Date().toISOString().slice(0, 10);
 }
+function taskStart(task) {
+  // +05:30 matches how the cron computes start time, whatever timezone the device is in
+  return new Date(`${task.date}T${task.time}:00+05:30`).getTime();
+}
 
+function fmt(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+}
+
+function countdown(task, now) {
+  if (task.status !== "pending") return null;
+  const start = taskStart(task);
+  const end = start + task.timerMinutes * 60000;
+  if (now < start) return { label: `Starts in ${fmt(start - now)}`, color: "var(--muted)" };
+  if (now < end) return { label: `${fmt(end - now)} left`, color: "var(--accent)" };
+  return { label: "Time's up", color: "var(--missed)" };
+}
+
+function StatusBadge({ task, now, label, color }) {
+  const cd = countdown(task, now);
+  return (
+    <span
+      style={{
+        fontSize: 12,
+        fontWeight: 600,
+        fontVariantNumeric: "tabular-nums",
+        color: cd ? cd.color : color,
+      }}
+    >
+      {cd ? cd.label : label}
+    </span>
+  );
+}
 export default function Home() {
+  const [now, setNow] = useState(Date.now());
+
+useEffect(() => {
+  const t = setInterval(() => setNow(Date.now()), 1000);
+  return () => clearInterval(t);
+}, []);
   const [date, setDate] = useState(todayString());
   const [tasks, setTasks] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -202,9 +245,12 @@ export default function Home() {
                   {task.reason ? ` · "${task.reason}"` : ""}
                 </div>
               </div>
-              <span style={{ fontSize: 12, color: statusColor[task.status], fontWeight: 600 }}>
-                {statusLabel[task.status]}
-              </span>
+            <StatusBadge
+  task={task}
+  now={now}
+  label={statusLabel[task.status]}
+  color={statusColor[task.status]}
+/>
             </div>
           ))}
         </div>
