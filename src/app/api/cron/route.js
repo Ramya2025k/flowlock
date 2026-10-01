@@ -1,12 +1,14 @@
 import { NextResponse } from "next/server";
-import { getActiveTasks, updateTask } from "@/lib/tasks";
+import { getActiveTasks, updateTask, ensureDefaultsForDate, istDate } from "@/lib/tasks";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60; // seconds this route may run (check your Vercel plan's limit)
+export const maxDuration = 60;
 
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const TICK_MS = 1000; // edit every 1s; raise to 2000 or 5000 if Telegram blocks you
-const LIVE_BUDGET_MS = 50 * 1000; // stop live ticking after 50s so the function isn't killed
+const TICK_MS = 1000; // countdown edit interval
+const LIVE_BUDGET_MS = 50 * 1000; // stop live ticking after 50s
+const GRACE_MS = 10 * 60 * 1000; // a missed start older than this is skipped silently
+const STALE_MS = 12 * 60 * 60 * 1000; // ignore tasks that ended more than 12h ago
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -21,7 +23,6 @@ async function tg(method, payload) {
   );
   const data = await res.json();
   if (!data.ok && data.error_code === 429) {
-    // Telegram says slow down: wait as long as it asks
     await sleep((data.parameters?.retry_after ?? 1) * 1000);
   }
   return data;
@@ -47,20 +48,72 @@ function countdownText(task, leftMs, totalMs) {
 }
 
 export async function GET(request) {
-  if (request.headers.get("authorization") !== `Bearer ${process.env.CRON_SECRET}`) {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || request.headers.get("authorization") !== `Bearer ${secret}`) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
-  const startedAt = Date.now();
-  const tasks = await getActiveTasks();
-  const results = [];
-  let liveUsed = false; // only one task gets the every-second countdown per call
 
+  const startedAt = Date.now();
+  const results = [];
+
+  // 0. Make sure today's default tasks exist
+  const created = await ensureDefaultsForDate(istDate());
+  if (created) results.push(`defaults created: ${created}`);
+
+  const tasks = await getActiveTasks();
+  const timerTasks = [];
+
+  // PASS 1: heads-up notifications and no-timer tasks (fast, never blocks)
   for (const task of tasks) {
+    const now = Date.now();
+    const startEpoch = taskEpoch(task);
+    const hasTimer = Number(task.timerMinutes) > 0;
+    const endEpoch = startEpoch + (hasTimer ? task.timerMinutes * 60 * 1000 : 0);
+    if (now > endEpoch + STALE_MS) continue;
+
+    // Heads-up before the task time
+    if (!task.notified) {
+      const notifyMs = Number(task.notifyMinutes ?? 3) * 60 * 1000;
+      if (notifyMs > 0 && now < startEpoch && now >= startEpoch - notifyMs) {
+        const mins = Math.max(1, Math.ceil((startEpoch - now) / 60000));
+        await tg("sendMessage", {
+          chat_id: CHAT_ID,
+          text: `🔔 Coming up in ${mins} min: ${task.title} (${task.time})`,
+        });
+        await updateTask(task.id, { notified: true });
+        task.notified = true;
+        results.push(`${task.id}: heads-up sent`);
+      } else if (now >= startEpoch) {
+        await updateTask(task.id, { notified: true });
+        task.notified = true;
+      }
+    }
+
+    if (hasTimer) {
+      timerTasks.push(task);
+      continue;
+    }
+
+    // No timer: announce at the task time and wait for Done
+    if (!task.startAnnounced && now >= startEpoch) {
+      if (now - startEpoch <= GRACE_MS) {
+        await tg("sendMessage", {
+          chat_id: CHAT_ID,
+          text: `▶️ Now: ${task.title}\n\nDone: 1 ${task.seq}`,
+        });
+        results.push(`${task.id}: announced`);
+      }
+      await updateTask(task.id, { startAnnounced: true });
+    }
+  }
+
+  // PASS 2: timer tasks (start message, live countdown, finish)
+  let liveUsed = false;
+  for (const task of timerTasks) {
     const startEpoch = taskEpoch(task);
     const totalMs = task.timerMinutes * 60 * 1000;
     const endEpoch = startEpoch + totalMs;
 
-    // 1. Start: send the countdown message and remember its id
     if (!task.timerStarted && Date.now() >= startEpoch) {
       const sent = await tg("sendMessage", {
         chat_id: CHAT_ID,
@@ -74,35 +127,34 @@ export async function GET(request) {
     }
 
     if (!task.timerStarted || task.completionAsked) continue;
-           if (!task.timerMessageId && Date.now() < endEpoch) {
-         const sent = await tg("sendMessage", {
-           chat_id: CHAT_ID,
-           text: countdownText(task, endEpoch - Date.now(), totalMs),
-         });
-         task.timerMessageId = sent?.result?.message_id ?? null;
-         await updateTask(task.id, { timerMessageId: task.timerMessageId });
-       }
 
-    // 2. Running: tick the same message
+    if (!task.timerMessageId && Date.now() < endEpoch) {
+      const sent = await tg("sendMessage", {
+        chat_id: CHAT_ID,
+        text: countdownText(task, endEpoch - Date.now(), totalMs),
+      });
+      task.timerMessageId = sent?.result?.message_id ?? null;
+      await updateTask(task.id, { timerMessageId: task.timerMessageId });
+    }
+
     if (!liveUsed && task.timerMessageId) {
       liveUsed = true;
       while (Date.now() < endEpoch && Date.now() - startedAt < LIVE_BUDGET_MS) {
         await sleep(TICK_MS);
         const left = endEpoch - Date.now();
         if (left <= 0) break;
-               const r = await tg("editMessageText", {
+        const r = await tg("editMessageText", {
           chat_id: CHAT_ID,
           message_id: task.timerMessageId,
           text: countdownText(task, left, totalMs),
         });
-        if (!r.ok) {
+        if (!r.ok && !String(r.description).includes("not modified")) {
           results.push(`edit failed: ${r.description}`);
           break;
         }
       }
       results.push(`${task.id}: live countdown ran`);
     } else if (task.timerMessageId && Date.now() < endEpoch) {
-      // other running tasks: one edit per call
       await tg("editMessageText", {
         chat_id: CHAT_ID,
         message_id: task.timerMessageId,
@@ -111,7 +163,6 @@ export async function GET(request) {
       continue;
     }
 
-    // 3. Finished: close the countdown, then ask how it went
     if (Date.now() >= endEpoch) {
       if (task.timerMessageId) {
         await tg("editMessageText", {

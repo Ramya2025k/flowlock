@@ -1,4 +1,5 @@
 import { redis } from "./redis";
+import { DEFAULT_TASKS } from "./defaults";
 
 export const CATEGORIES = ["Study", "Work", "Growth", "Health", "Personal"];
 export const STATUS = {
@@ -8,8 +9,13 @@ export const STATUS = {
   COULDNT: "couldnt",
 };
 
+// Today's date in India time (the server runs in UTC)
+export function istDate(now = Date.now()) {
+  return new Date(now + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
 export async function createTask(task) {
-  const id = `task_${Date.now()}`;
+  const id = `task_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   const seq = await redis.incr("task:seq:counter");
 
   const fullTask = {
@@ -19,9 +25,17 @@ export async function createTask(task) {
     category: task.category,
     date: task.date,
     time: task.time,
-    timerMinutes: task.timerMinutes,
+    timerMinutes: Number(task.timerMinutes) || 0, // 0 = no timer
+    notifyMinutes:
+      task.notifyMinutes === undefined || task.notifyMinutes === null
+        ? 3
+        : Number(task.notifyMinutes), // 0 = no heads-up
+    isDefault: Boolean(task.isDefault),
+    defaultKey: task.defaultKey || null,
     status: STATUS.PENDING,
     reason: null,
+    notified: false,
+    startAnnounced: false,
     timerStarted: false,
     completionAsked: false,
     awaitingReason: false,
@@ -34,6 +48,30 @@ export async function createTask(task) {
   await redis.sadd(`tasks:allActive`, id);
 
   return fullTask;
+}
+
+// Create today's copies of the default tasks (safe to call every minute)
+export async function ensureDefaultsForDate(date) {
+  let created = 0;
+  for (const d of DEFAULT_TASKS) {
+    const claimed = await redis.set(`default:${date}:${d.key}`, "1", {
+      nx: true,
+      ex: 60 * 60 * 48,
+    });
+    if (!claimed) continue; // already created for this date
+    await createTask({
+      title: d.title,
+      category: d.category,
+      date,
+      time: d.time,
+      timerMinutes: 0,
+      notifyMinutes: d.notifyMinutes,
+      isDefault: true,
+      defaultKey: d.key,
+    });
+    created++;
+  }
+  return created;
 }
 
 export async function getTaskBySeq(seq) {
